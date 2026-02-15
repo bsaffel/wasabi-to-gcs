@@ -6,8 +6,8 @@ help: ## Show this help message
 	@printf "Usage: make <target>\n\n"
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-20s %s\n", $$1, $$2}'
 
-build: ## Build the migrate binary
-	go build -o migrate .
+build: ## Build the wasabi-to-gcs binary
+	go build -o wasabi-to-gcs .
 
 run: ## Build and run the migration tool
 	go run .
@@ -32,4 +32,4 @@ tidy: ## Tidy go module dependencies
 	go mod tidy
 
 clean: ## Remove build artifacts
-	rm -f migrate coverage.out coverage.html
+	rm -f wasabi-to-gcs coverage.out coverage.html

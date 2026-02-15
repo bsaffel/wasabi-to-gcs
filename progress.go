@@ -27,10 +27,12 @@ type ProgressReporter struct {
 	totalObjects   atomic.Int64
 	skippedObjects atomic.Int64
 
-	completedBytes atomic.Int64
-	completedFiles atomic.Int64
-	failedFiles    atomic.Int64
-	logger         *slog.Logger
+	completedBytes   atomic.Int64
+	completedFiles   atomic.Int64
+	transferredBytes atomic.Int64 // bytes actually transferred this session (excludes resumed)
+	failedFiles      atomic.Int64
+	startTime        time.Time
+	logger           *slog.Logger
 }
 
 // ProgressStats holds current progress statistics.
@@ -58,6 +60,7 @@ func NewProgressReporter(logger *slog.Logger, verbose bool, numWorkers int, outp
 		container:   container,
 		currentBars: make([]*mpb.Bar, numWorkers),
 		numWorkers:  numWorkers,
+		startTime:   time.Now(),
 		logger:      logger,
 	}
 
@@ -79,7 +82,15 @@ func NewProgressReporter(logger *slog.Logger, verbose bool, numWorkers int, outp
 		),
 		mpb.AppendDecorators(
 			decor.Percentage(decor.WCSyncSpace),
-			decor.AverageSpeed(decor.SizeB1024(0), "% .1f", decor.WCSyncSpace),
+			decor.Any(func(s decor.Statistics) string {
+				transferred := pr.transferredBytes.Load()
+				elapsed := time.Since(pr.startTime).Seconds()
+				if transferred == 0 || elapsed < 1 {
+					return "-- MiB/s"
+				}
+				speed := float64(transferred) / elapsed / (1024 * 1024)
+				return fmt.Sprintf("%.1f MiB/s", speed)
+			}, decor.WCSyncSpace),
 			decor.AverageETA(decor.ET_STYLE_MMSS, decor.WCSyncSpace),
 		),
 	)
@@ -156,6 +167,7 @@ func (pr *ProgressReporter) CompleteTransfer(workerID int, job ObjectJob) {
 
 	pr.overallBar.IncrBy(int(job.Size))
 	pr.completedBytes.Add(job.Size)
+	pr.transferredBytes.Add(job.Size)
 	pr.completedFiles.Add(1)
 }
 

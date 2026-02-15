@@ -1932,7 +1932,7 @@ func TestProgressReporter_ResumeShowsCorrectStartingPercentage(t *testing.T) {
 .PHONY: test test-race test-integration test-coverage lint build
 
 build:
-	go build -o migrate .
+	go build -o wasabi-to-gcs .
 
 test:
 	go test -v -short ./...
@@ -1986,7 +1986,7 @@ lint:
 **Basic migration:**
 
 ```bash
-./migrate \
+./wasabi-to-gcs \
   --wasabi-endpoint="https://s3.wasabisys.com" \
   --wasabi-region="us-east-1" \
   --wasabi-access-key="$WASABI_KEY" \
@@ -1998,7 +1998,7 @@ lint:
 **With prefix and custom workers:**
 
 ```bash
-./migrate \
+./wasabi-to-gcs \
   --wasabi-endpoint="https://s3.wasabisys.com" \
   --wasabi-region="us-east-1" \
   --wasabi-access-key="$WASABI_KEY" \
@@ -2013,7 +2013,7 @@ lint:
 **Dry run:**
 
 ```bash
-./migrate \
+./wasabi-to-gcs \
   --wasabi-endpoint="https://s3.wasabisys.com" \
   ... \
   --dry-run
@@ -2022,7 +2022,7 @@ lint:
 **With verbose logging (logs shown in terminal alongside progress bars):**
 
 ```bash
-./migrate \
+./wasabi-to-gcs \
   --wasabi-endpoint="https://s3.wasabisys.com" \
   ... \
   --verbose
@@ -2031,7 +2031,7 @@ lint:
 **Force re-scan (ignore cached manifest from previous run):**
 
 ```bash
-./migrate \
+./wasabi-to-gcs \
   --wasabi-endpoint="https://s3.wasabisys.com" \
   ... \
   --rescan
@@ -2041,7 +2041,7 @@ lint:
 
 ```bash
 # Just re-run with same flags — state dir has completion records and manifest
-./migrate \
+./wasabi-to-gcs \
   --wasabi-endpoint="https://s3.wasabisys.com" \
   --wasabi-region="us-east-1" \
   --wasabi-access-key="$WASABI_KEY" \

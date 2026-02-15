@@ -36,6 +36,7 @@ type Config struct {
 	MaxRetries int
 	StateDir   string
 	DryRun     bool
+	Speedtest  bool
 
 	// Observability
 	Logger   *slog.Logger

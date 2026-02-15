@@ -78,6 +78,23 @@ func (sm *StateManager) CompletedCount() int {
 	return len(sm.completed)
 }
 
+// CompletedCountForPrefix returns the number of completed objects whose keys
+// start with the given prefix. An empty prefix matches all keys.
+func (sm *StateManager) CompletedCountForPrefix(prefix string) int {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if prefix == "" {
+		return len(sm.completed)
+	}
+	var count int
+	for key := range sm.completed {
+		if strings.HasPrefix(key, prefix) {
+			count++
+		}
+	}
+	return count
+}
+
 // CompletedBytes returns the total bytes of all completed objects.
 func (sm *StateManager) CompletedBytes() int64 {
 	sm.mu.Lock()
@@ -85,6 +102,20 @@ func (sm *StateManager) CompletedBytes() int64 {
 	var total int64
 	for _, size := range sm.completed {
 		total += size
+	}
+	return total
+}
+
+// CompletedBytesForPrefix returns the total bytes of completed objects whose
+// keys start with the given prefix. An empty prefix matches all keys.
+func (sm *StateManager) CompletedBytesForPrefix(prefix string) int64 {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	var total int64
+	for key, size := range sm.completed {
+		if prefix == "" || strings.HasPrefix(key, prefix) {
+			total += size
+		}
 	}
 	return total
 }

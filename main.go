@@ -134,22 +134,22 @@ func newRootCmd() *cobra.Command {
 	var logLevel string
 
 	cmd := &cobra.Command{
-		Use:   "migrate",
+		Use:   "wasabi-to-gcs",
 		Short: "Migrate objects from Wasabi S3 to Google Cloud Storage",
-		Long: `migrate streams objects from a Wasabi S3 bucket to a GCS bucket with
+		Long: `wasabi-to-gcs streams objects from a Wasabi S3 bucket to a GCS bucket with
 concurrent workers, resumability, progress tracking, and integrity verification.
 
 Transfers are idempotent — re-running picks up where the previous run left off.
 Each completed object is recorded in a local state directory, so interrupted
 migrations resume without re-transferring.`,
 		Example: `  # Basic migration
-  migrate --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
+  wasabi-to-gcs --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
           --wasabi-region us-east-1 \
           --wasabi-bucket my-source \
           --gcs-bucket my-destination
 
   # Migrate a specific prefix with 20 workers
-  migrate --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
+  wasabi-to-gcs --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
           --wasabi-region us-east-1 \
           --wasabi-bucket my-source \
           --gcs-bucket my-destination \
@@ -157,21 +157,28 @@ migrations resume without re-transferring.`,
           --workers 20
 
   # Dry run to see what would be transferred
-  migrate --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
+  wasabi-to-gcs --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
           --wasabi-region us-east-1 \
           --wasabi-bucket my-source \
           --gcs-bucket my-destination \
           --dry-run
 
+  # Speed test — profile throughput to Wasabi and GCS
+  wasabi-to-gcs --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
+          --wasabi-region us-east-1 \
+          --wasabi-bucket my-source \
+          --gcs-bucket my-destination \
+          --speedtest
+
   # Resume a previous migration, forcing a fresh scan
-  migrate --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
+  wasabi-to-gcs --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
           --wasabi-region us-east-1 \
           --wasabi-bucket my-source \
           --gcs-bucket my-destination \
           --rescan
 
   # Re-run a completed migration
-  migrate --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
+  wasabi-to-gcs --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
           --wasabi-region us-east-1 \
           --wasabi-bucket my-source \
           --gcs-bucket my-destination \
@@ -180,10 +187,15 @@ migrations resume without re-transferring.`,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resolveLogLevel(logLevel, cfg)
+			resolveEnvCredentials(cmd, cfg)
 
 			if err := cfg.Validate(); err != nil {
 				printStyledError(err)
 				return &exitError{code: 2, err: err}
+			}
+
+			if cfg.Speedtest {
+				return runSpeedtest(cfg)
 			}
 
 			return runMigration(cfg)
@@ -205,9 +217,9 @@ func registerFlags(cmd *cobra.Command, cfg *Config, logLevel *string) {
 	// Source (Wasabi)
 	f.StringVar(&cfg.WasabiEndpoint, "wasabi-endpoint", "", "Wasabi S3 endpoint URL")
 	f.StringVar(&cfg.WasabiRegion, "wasabi-region", "", "Wasabi region (e.g. us-east-1)")
-	f.StringVar(&cfg.WasabiAccessKey, "wasabi-access-key", os.Getenv("WASABI_ACCESS_KEY"),
+	f.StringVar(&cfg.WasabiAccessKey, "wasabi-access-key", "",
 		"Wasabi access key [$WASABI_ACCESS_KEY]")
-	f.StringVar(&cfg.WasabiSecretKey, "wasabi-secret-key", os.Getenv("WASABI_SECRET_KEY"),
+	f.StringVar(&cfg.WasabiSecretKey, "wasabi-secret-key", "",
 		"Wasabi secret key [$WASABI_SECRET_KEY]")
 	f.StringVar(&cfg.WasabiBucket, "wasabi-bucket", "", "Source Wasabi bucket name")
 
@@ -221,6 +233,7 @@ func registerFlags(cmd *cobra.Command, cfg *Config, logLevel *string) {
 	f.IntVar(&cfg.MaxRetries, "max-retries", 3, "Max retry attempts per object (0-10)")
 	f.StringVar(&cfg.StateDir, "state-dir", "./migration_state", "Directory for resumable state tracking")
 	f.BoolVar(&cfg.DryRun, "dry-run", false, "Scan and count objects without transferring")
+	f.BoolVar(&cfg.Speedtest, "speedtest", false, "Profile Wasabi/GCS throughput and identify bottleneck")
 	f.BoolVar(&cfg.Rescan, "rescan", false, "Force re-scan of source bucket, ignore cached manifest")
 	f.BoolVar(&cfg.Force, "force", false, "Force restart of a completed migration")
 
@@ -235,7 +248,7 @@ func registerFlags(cmd *cobra.Command, cfg *Config, logLevel *string) {
 	for _, name := range []string{"gcs-project", "gcs-bucket"} {
 		setFlagGroup(cmd, name, "destination")
 	}
-	for _, name := range []string{"prefix", "workers", "max-retries", "state-dir", "dry-run", "rescan", "force"} {
+	for _, name := range []string{"prefix", "workers", "max-retries", "state-dir", "dry-run", "speedtest", "rescan", "force"} {
 		setFlagGroup(cmd, name, "transfer")
 	}
 	for _, name := range []string{"verbose", "log-level"} {
@@ -255,6 +268,19 @@ func resolveLogLevel(level string, cfg *Config) {
 		cfg.LogLevel = slog.LevelError
 	default:
 		cfg.LogLevel = slog.LevelInfo
+	}
+}
+
+func resolveEnvCredentials(cmd *cobra.Command, cfg *Config) {
+	if !cmd.Flags().Changed("wasabi-access-key") {
+		if v := os.Getenv("WASABI_ACCESS_KEY"); v != "" {
+			cfg.WasabiAccessKey = v
+		}
+	}
+	if !cmd.Flags().Changed("wasabi-secret-key") {
+		if v := os.Getenv("WASABI_SECRET_KEY"); v != "" {
+			cfg.WasabiSecretKey = v
+		}
 	}
 }
 
@@ -324,11 +350,11 @@ func runMigration(cfg *Config) error {
 
 	// Detect already-completed migration
 	if manifest != nil {
-		completedCount := int64(state.CompletedCount())
+		completedCount := int64(state.CompletedCountForPrefix(cfg.Prefix))
 		remaining := manifest.TotalObjects - completedCount
 		if remaining <= 0 {
 			if !cfg.Force {
-				printAlreadyComplete(manifest, state)
+				printAlreadyComplete(manifest, state, cfg.Prefix)
 				return &exitError{code: 0, err: fmt.Errorf("migration already complete; use --force to restart")}
 			}
 			// --force: clear completed state and re-scan
@@ -340,7 +366,7 @@ func runMigration(cfg *Config) error {
 				warnStyle.Render("Force restart"),
 				dimStyle.Render("cleared previous state, re-scanning"))
 		} else {
-			printResumeInfo(manifest, state)
+			printResumeInfo(manifest, state, cfg.Prefix)
 		}
 	}
 
@@ -379,8 +405,8 @@ func runMigration(cfg *Config) error {
 		progress.UpdateScanTotals(
 			manifest.TotalObjects,
 			manifest.TotalBytes,
-			int64(state.CompletedCount()),
-			state.CompletedBytes(),
+			int64(state.CompletedCountForPrefix(cfg.Prefix)),
+			state.CompletedBytesForPrefix(cfg.Prefix),
 		)
 	}
 
@@ -544,9 +570,9 @@ func printBanner(cfg *Config) {
 	fmt.Fprintln(os.Stderr, strings.Join(lines, "\n"))
 }
 
-func printAlreadyComplete(manifest *MigrationManifest, state *StateManager) {
-	completedCount := state.CompletedCount()
-	completedBytes := state.CompletedBytes()
+func printAlreadyComplete(manifest *MigrationManifest, state *StateManager, prefix string) {
+	completedCount := state.CompletedCountForPrefix(prefix)
+	completedBytes := state.CompletedBytesForPrefix(prefix)
 
 	fmt.Fprintf(os.Stderr, "%s %s\n",
 		warnStyle.Render("Already complete"),
@@ -562,9 +588,9 @@ func printAlreadyComplete(manifest *MigrationManifest, state *StateManager) {
 	fmt.Fprintln(os.Stderr)
 }
 
-func printResumeInfo(manifest *MigrationManifest, state *StateManager) {
-	completedCount := state.CompletedCount()
-	completedBytes := state.CompletedBytes()
+func printResumeInfo(manifest *MigrationManifest, state *StateManager, prefix string) {
+	completedCount := state.CompletedCountForPrefix(prefix)
+	completedBytes := state.CompletedBytesForPrefix(prefix)
 	remainingCount := manifest.TotalObjects - int64(completedCount)
 	remainingBytes := manifest.TotalBytes - completedBytes
 
@@ -668,7 +694,7 @@ func printStyledError(err error) {
 		}
 	}
 	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, dimStyle.Render("  Run 'migrate --help' for usage information."))
+	fmt.Fprintln(os.Stderr, dimStyle.Render("  Run 'wasabi-to-gcs --help' for usage information."))
 	fmt.Fprintln(os.Stderr)
 }
 
