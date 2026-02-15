@@ -2,13 +2,11 @@ package main
 
 import (
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // Sentinel errors for fatal conditions
@@ -46,6 +44,7 @@ type Config struct {
 	// Console behavior
 	Verbose bool
 	Rescan  bool
+	Force   bool
 }
 
 // Validate checks all required fields and constraints.
@@ -98,49 +97,3 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// ParseFlags parses command-line flags and environment variables.
-func ParseFlags() (*Config, error) {
-	cfg := &Config{
-		Workers:    10,
-		MaxRetries: 3,
-		StateDir:   "./migration_state",
-		LogLevel:   slog.LevelInfo,
-	}
-
-	flag.StringVar(&cfg.WasabiEndpoint, "wasabi-endpoint", "", "Wasabi S3 endpoint URL")
-	flag.StringVar(&cfg.WasabiRegion, "wasabi-region", "", "Wasabi region")
-	flag.StringVar(&cfg.WasabiAccessKey, "wasabi-access-key", os.Getenv("WASABI_ACCESS_KEY"), "Wasabi access key (or WASABI_ACCESS_KEY env)")
-	flag.StringVar(&cfg.WasabiSecretKey, "wasabi-secret-key", os.Getenv("WASABI_SECRET_KEY"), "Wasabi secret key (or WASABI_SECRET_KEY env)")
-	flag.StringVar(&cfg.WasabiBucket, "wasabi-bucket", "", "Source Wasabi bucket")
-	flag.StringVar(&cfg.GCSProject, "gcs-project", "", "GCP project ID")
-	flag.StringVar(&cfg.GCSBucket, "gcs-bucket", "", "Destination GCS bucket")
-	flag.StringVar(&cfg.Prefix, "prefix", "", "Object prefix filter")
-	flag.IntVar(&cfg.Workers, "workers", 10, "Concurrent workers (1-100)")
-	flag.IntVar(&cfg.MaxRetries, "max-retries", 3, "Max retries per object (0-10)")
-	flag.StringVar(&cfg.StateDir, "state-dir", "./migration_state", "State directory for resumability")
-	flag.BoolVar(&cfg.DryRun, "dry-run", false, "List objects without transferring")
-	flag.BoolVar(&cfg.Verbose, "verbose", false, "Show log lines in terminal alongside progress bars")
-	flag.BoolVar(&cfg.Rescan, "rescan", false, "Force re-enumeration of source bucket, ignore cached manifest")
-
-	var logLevel string
-	flag.StringVar(&logLevel, "log-level", "info", "Log level (debug/info/warn/error)")
-
-	flag.Parse()
-
-	switch strings.ToLower(logLevel) {
-	case "debug":
-		cfg.LogLevel = slog.LevelDebug
-	case "info":
-		cfg.LogLevel = slog.LevelInfo
-	case "warn":
-		cfg.LogLevel = slog.LevelWarn
-	case "error":
-		cfg.LogLevel = slog.LevelError
-	}
-
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-
-	return cfg, nil
-}

@@ -89,6 +89,23 @@ func (sm *StateManager) CompletedBytes() int64 {
 	return total
 }
 
+// Reset clears all completed state, truncating the log file and in-memory map.
+func (sm *StateManager) Reset() error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.completed = make(map[string]int64)
+	if sm.file != nil {
+		if err := sm.file.Truncate(0); err != nil {
+			return fmt.Errorf("truncate state file: %w", err)
+		}
+		if _, err := sm.file.Seek(0, 0); err != nil {
+			return fmt.Errorf("seek state file: %w", err)
+		}
+	}
+	return nil
+}
+
 // Close flushes and closes the state file.
 func (sm *StateManager) Close() error {
 	sm.mu.Lock()

@@ -1,5 +1,5 @@
 # Binary
-migrate
+wasabi-to-gcs
 
 # Go build artifacts
 *.exe
@@ -26,3 +26,9 @@ migration_state/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local environment settings
+.env
+
+# Personal test commands
+commands.txt

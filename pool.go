@@ -11,9 +11,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// WorkerPool processes transfer jobs concurrently using a buffered channel semaphore.
+// WorkerPool processes transfer jobs concurrently using a buffered channel
+// of slot IDs as a semaphore. Each slot ID (0..N-1) corresponds to a
+// reusable per-worker progress bar.
 type WorkerPool struct {
-	sem        chan struct{}
+	sem        chan int // carries slot IDs 0..N-1
 	maxWorkers int
 
 	jobs     <-chan ObjectJob
@@ -26,13 +28,17 @@ type WorkerPool struct {
 	completedJobs atomic.Int64
 	failedJobs    atomic.Int64
 	totalBytes    atomic.Int64
-	nextWorkerID  atomic.Int64
 }
 
 // NewWorkerPool creates a WorkerPool with the given configuration.
 func NewWorkerPool(workers int, jobs <-chan ObjectJob, engine *TransferEngine, state *StateManager, progress *ProgressReporter, logger *slog.Logger) *WorkerPool {
+	sem := make(chan int, workers)
+	for i := 0; i < workers; i++ {
+		sem <- i
+	}
+
 	return &WorkerPool{
-		sem:        make(chan struct{}, workers),
+		sem:        sem,
 		maxWorkers: workers,
 		jobs:       jobs,
 		engine:     engine,
@@ -49,19 +55,19 @@ func (wp *WorkerPool) Run(ctx context.Context) error {
 	for job := range wp.jobs {
 		job := job // Capture for goroutine
 
-		// Acquire semaphore slot (blocks if at capacity)
+		// Acquire a worker slot (blocks if at capacity)
+		var workerID int
 		select {
-		case wp.sem <- struct{}{}:
+		case workerID = <-wp.sem:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 
 		wp.activeWorkers.Add(1)
-		workerID := int(wp.nextWorkerID.Add(1))
 
 		g.Go(func() error {
 			defer func() {
-				<-wp.sem // Release semaphore slot
+				wp.sem <- workerID // Return slot ID
 				wp.activeWorkers.Add(-1)
 			}()
 

@@ -4,8 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
-	"sync"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -13,13 +12,20 @@ import (
 	"github.com/vbauerster/mpb/v8/decor"
 )
 
-// ProgressReporter manages overall and per-worker progress bars via mpb.
+// ProgressReporter manages per-file and overall progress bars via mpb.
+// Each file transfer gets its own bar that persists at 100% after completion,
+// providing a visual log of all transferred files with their transfer speeds.
 type ProgressReporter struct {
-	container    *mpb.Progress
-	overallBar   *mpb.Bar
-	workerBars   map[int]*mpb.Bar
-	mu           sync.Mutex
-	scanComplete atomic.Bool
+	container  *mpb.Progress
+	overallBar *mpb.Bar
+
+	currentBars []*mpb.Bar  // indexed by workerID, holds active transfer bars
+	numWorkers  int
+	barCounter  atomic.Int64 // incrementing priority for new file bars
+
+	scanComplete   atomic.Bool
+	totalObjects   atomic.Int64
+	skippedObjects atomic.Int64
 
 	completedBytes atomic.Int64
 	completedFiles atomic.Int64
@@ -35,23 +41,40 @@ type ProgressStats struct {
 }
 
 // NewProgressReporter creates a progress reporter with an overall bar.
-func NewProgressReporter(logger *slog.Logger) *ProgressReporter {
+// Per-file bars are created dynamically as transfers start and persist
+// at 100% after completion. When verbose is true, progress bar output
+// is suppressed so that slog output on stderr is not corrupted.
+func NewProgressReporter(logger *slog.Logger, verbose bool, numWorkers int, output io.Writer) *ProgressReporter {
+	if verbose {
+		output = io.Discard
+	}
+
 	container := mpb.New(
-		mpb.WithOutput(os.Stderr),
+		mpb.WithOutput(output),
 		mpb.WithRefreshRate(150*time.Millisecond),
 	)
 
 	pr := &ProgressReporter{
-		container:  container,
-		workerBars: make(map[int]*mpb.Bar),
-		logger:     logger,
+		container:   container,
+		currentBars: make([]*mpb.Bar, numWorkers),
+		numWorkers:  numWorkers,
+		logger:      logger,
 	}
 
-	// Create overall bar in indeterminate mode (total=0 until scan provides data)
+	// Overall bar stays at the very bottom (highest priority value).
+	// mpb sorts ascending by priority: lower = top, higher = bottom.
 	pr.overallBar = container.New(0,
 		mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding(" ").Rbound("]"),
+		mpb.BarPriority(math.MaxInt),
 		mpb.PrependDecorators(
-			decor.Name("Overall: "),
+			decor.Any(func(s decor.Statistics) string {
+				completed := pr.completedFiles.Load() + pr.skippedObjects.Load()
+				total := pr.totalObjects.Load()
+				if total == 0 {
+					return "Overall: "
+				}
+				return fmt.Sprintf("Overall (%d/%d): ", completed, total)
+			}),
 			decor.CountersKibiByte("% .2f / % .2f"),
 		),
 		mpb.AppendDecorators(
@@ -67,6 +90,8 @@ func NewProgressReporter(logger *slog.Logger) *ProgressReporter {
 // UpdateScanTotals is called by the lister after each page to update the
 // overall bar's denominator.
 func (pr *ProgressReporter) UpdateScanTotals(totalObjects, totalBytes, skippedObjects, skippedBytes int64) {
+	pr.totalObjects.Store(totalObjects)
+	pr.skippedObjects.Store(skippedObjects)
 	pr.overallBar.SetTotal(totalBytes, false)
 
 	// Pre-load completed bytes from previously skipped objects so the bar
@@ -85,43 +110,48 @@ func (pr *ProgressReporter) ScanComplete() {
 	pr.scanComplete.Store(true)
 }
 
-// StartTransfer creates a per-worker progress bar for the given transfer.
+// StartTransfer creates a new per-file progress bar for the transfer.
+// The bar persists at 100% after completion via mpb's auto-complete
+// (triggerComplete=true when total > 0).
 func (pr *ProgressReporter) StartTransfer(workerID int, job ObjectJob) {
-	displayName := job.Key
-	if len(displayName) > 40 {
-		displayName = "..." + displayName[len(displayName)-37:]
+	if workerID < 0 || workerID >= pr.numWorkers {
+		return
 	}
+
+	displayName := job.Key
+	if len(displayName) > 50 {
+		displayName = "..." + displayName[len(displayName)-47:]
+	}
+
+	priority := int(pr.barCounter.Add(1))
 
 	bar := pr.container.New(job.Size,
 		mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding(" ").Rbound("]"),
-		mpb.BarRemoveOnComplete(),
+		mpb.BarPriority(priority),
 		mpb.PrependDecorators(
-			decor.Name(fmt.Sprintf("  W%02d ", workerID)),
-			decor.Name(displayName, decor.WCSyncSpaceR),
+			decor.Name("  "+displayName+" ", decor.WCSyncSpaceR),
 		),
 		mpb.AppendDecorators(
 			decor.Percentage(decor.WCSyncSpace),
-			decor.CountersKibiByte("% .1f / % .1f"),
-			decor.AverageSpeed(decor.SizeB1024(0), " % .1f", decor.WCSyncSpace),
+			decor.CountersKibiByte("% .1f / % .1f", decor.WCSyncSpace),
+			decor.AverageSpeed(decor.SizeB1024(0), "% .1f", decor.WCSyncSpace),
 		),
 	)
 
-	pr.mu.Lock()
-	pr.workerBars[workerID] = bar
-	pr.mu.Unlock()
+	pr.currentBars[workerID] = bar
 }
 
-// CompleteTransfer marks a per-worker bar as complete and increments the overall bar.
+// CompleteTransfer marks a per-file bar as complete and increments the overall bar.
 func (pr *ProgressReporter) CompleteTransfer(workerID int, job ObjectJob) {
-	pr.mu.Lock()
-	bar, exists := pr.workerBars[workerID]
-	if exists {
-		delete(pr.workerBars, workerID)
-	}
-	pr.mu.Unlock()
-
-	if exists {
-		bar.SetTotal(job.Size, true)
+	if workerID >= 0 && workerID < pr.numWorkers {
+		bar := pr.currentBars[workerID]
+		if bar != nil {
+			// Ensure bar shows exactly 100%. If the bar already auto-completed
+			// (current >= total with triggerComplete=true), these are safe no-ops.
+			bar.SetCurrent(job.Size)
+			bar.SetTotal(job.Size, true)
+			pr.currentBars[workerID] = nil
+		}
 	}
 
 	pr.overallBar.IncrBy(int(job.Size))
@@ -129,42 +159,69 @@ func (pr *ProgressReporter) CompleteTransfer(workerID int, job ObjectJob) {
 	pr.completedFiles.Add(1)
 }
 
-// FailTransfer aborts a per-worker bar and increments the failure counter.
+// FailTransfer removes the per-file bar and increments the failure counter.
 func (pr *ProgressReporter) FailTransfer(workerID int, job ObjectJob, err error) {
-	pr.mu.Lock()
-	bar, exists := pr.workerBars[workerID]
-	if exists {
-		delete(pr.workerBars, workerID)
-	}
-	pr.mu.Unlock()
-
-	if exists {
-		bar.Abort(true)
+	if workerID >= 0 && workerID < pr.numWorkers {
+		bar := pr.currentBars[workerID]
+		if bar != nil {
+			bar.Abort(true)
+			pr.currentBars[workerID] = nil
+		}
 	}
 
 	pr.failedFiles.Add(1)
 }
 
-// WrapReader returns a reader that updates the per-worker progress bar.
-func (pr *ProgressReporter) WrapReader(r io.Reader, workerID int) io.Reader {
-	pr.mu.Lock()
-	bar, exists := pr.workerBars[workerID]
-	pr.mu.Unlock()
+// barCountingReader wraps an io.Reader and increments an mpb bar on each read.
+// After the bar auto-completes, IncrBy calls become safe no-ops via the
+// bar's done channel.
+type barCountingReader struct {
+	r   io.Reader
+	bar *mpb.Bar
+}
 
-	if !exists {
+func (cr *barCountingReader) Read(p []byte) (int, error) {
+	n, err := cr.r.Read(p)
+	if n > 0 {
+		cr.bar.IncrBy(n)
+	}
+	return n, err
+}
+
+// WrapReader returns a reader that updates the per-file progress bar.
+func (pr *ProgressReporter) WrapReader(r io.Reader, workerID int) io.Reader {
+	if workerID < 0 || workerID >= pr.numWorkers {
 		return r
 	}
 
-	return bar.ProxyReader(r)
+	bar := pr.currentBars[workerID]
+	if bar == nil {
+		return r
+	}
+
+	return &barCountingReader{r: r, bar: bar}
 }
 
-// ReportError logs an error safely above the progress bars.
+// ReportError logs an error to the structured logger.
+// Direct stderr writes are avoided to prevent corrupting mpb's display.
 func (pr *ProgressReporter) ReportError(key string, err error) {
-	fmt.Fprintf(os.Stderr, "\r  ERROR %s: %v\n", key, err)
 	pr.logger.Warn("transfer error",
 		slog.String("key", key),
 		slog.Any("error", err),
 	)
+}
+
+// Complete marks the overall bar as finished so that container.Wait() can return.
+// Any still-active file bars are aborted to clean them up.
+func (pr *ProgressReporter) Complete() {
+	for i, bar := range pr.currentBars {
+		if bar != nil {
+			bar.Abort(true)
+			pr.currentBars[i] = nil
+		}
+	}
+
+	pr.overallBar.SetTotal(pr.overallBar.Current(), true)
 }
 
 // Wait blocks until all progress bars complete rendering.

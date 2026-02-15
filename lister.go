@@ -48,8 +48,12 @@ func (l *Lister) ScanAndStream(ctx context.Context, jobs chan<- ObjectJob) error
 			return fmt.Errorf("list objects: %w", err)
 		}
 
+		// First pass: count totals and collect jobs to send.
+		// This lets us update the overall bar's denominator BEFORE
+		// sending jobs to the bounded channel (which blocks when full).
 		var pageObjects, pageBytes int64
 		var pageSkippedObjects, pageSkippedBytes int64
+		var pageJobs []ObjectJob
 
 		for _, obj := range page.Contents {
 			// Skip zero-size objects (folders)
@@ -67,14 +71,10 @@ func (l *Lister) ScanAndStream(ctx context.Context, jobs chan<- ObjectJob) error
 				continue
 			}
 
-			select {
-			case jobs <- ObjectJob{Key: *obj.Key, Size: *obj.Size, ETag: *obj.ETag}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+			pageJobs = append(pageJobs, ObjectJob{Key: *obj.Key, Size: *obj.Size, ETag: *obj.ETag})
 		}
 
-		// Update running totals after each page
+		// Update running totals before sending jobs
 		l.totalObjects.Add(pageObjects)
 		l.totalBytes.Add(pageBytes)
 		l.skippedObjects.Add(pageSkippedObjects)
@@ -87,6 +87,15 @@ func (l *Lister) ScanAndStream(ctx context.Context, jobs chan<- ObjectJob) error
 			l.skippedObjects.Load(),
 			l.skippedBytes.Load(),
 		)
+
+		// Second pass: send jobs (may block on bounded channel)
+		for _, job := range pageJobs {
+			select {
+			case jobs <- job:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 	}
 
 	// Scan complete — save manifest for future resume runs

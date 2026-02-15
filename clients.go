@@ -75,6 +75,7 @@ func newWasabiClient(ctx context.Context, cfg *Config) (*s3.Client, error) {
 func newGCSClient(ctx context.Context) (*storage.Client, error) {
 	client, err := storage.NewGRPCClient(ctx,
 		option.WithGRPCConnectionPool(4),
+		storage.WithDisabledClientMetrics(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create gcs client: %w", err)
