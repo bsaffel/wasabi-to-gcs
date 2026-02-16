@@ -27,6 +27,9 @@ migration_state/
 .DS_Store
 Thumbs.db
 
+# Claude Code - local/personal files (settings.json and CLAUDE.md are intentionally tracked)
+.claude/settings.local.json
+
 # Local environment settings
 .env
 
