@@ -62,6 +62,9 @@ func (te *TransferEngine) Transfer(ctx context.Context, workerID int, job Object
 
 	for attempt := 0; attempt <= te.maxRetries; attempt++ {
 		if attempt > 0 {
+			// Reset the progress bar for this retry attempt
+			te.progress.RetryTransfer(workerID, attempt)
+
 			backoff := te.calculateBackoff(attempt)
 			te.logger.Debug("retrying transfer",
 				slog.String("key", job.Key),
@@ -215,6 +218,19 @@ func isRetryable(err error) bool {
 
 	// GCS 5xx errors
 	if strings.Contains(err.Error(), "googleapi: Error 5") {
+		return true
+	}
+
+	// Streaming errors — connection drops mid-transfer from Wasabi
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+
+	// Connection reset / broken pipe (common with large transfers)
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "connection reset") ||
+		strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "unexpected EOF") {
 		return true
 	}
 

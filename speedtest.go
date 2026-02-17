@@ -20,15 +20,18 @@ const (
 	speedtestGCSPrefix         = "__speedtest/"
 	speedtestMaxObject         = 100 * 1024 * 1024 // 100 MiB cap for test downloads
 	speedtestGCSChunkSize      = 16 * 1024 * 1024  // 16 MiB, matches transfer.go
-	speedtestTimeout           = 5 * time.Minute
-	speedtestPerWorkerDownload = 5 * 1024 * 1024 // 5 MiB per worker for download tests
-	speedtestPerWorkerUpload   = 3 * 1024 * 1024 // 3 MiB per worker for upload tests
-	scalingGainThreshold       = 0.10            // 10% improvement needed to recommend more workers
-	stallThreshold             = 0.05            // 5% improvement threshold for early stopping
-	stallCountForStop          = 2               // consecutive stalled levels before stopping
+	speedtestTimeout           = 10 * time.Minute
+	speedtestPerWorkerDownload = 5 * 1024 * 1024   // 5 MiB per worker for download tests
+	speedtestPerWorkerUpload   = 3 * 1024 * 1024   // 3 MiB per worker for upload tests
+	speedtestMinTotalDownload  = 256 * 1024 * 1024  // 256 MiB minimum total download per tier
+	speedtestMinTotalUpload    = 128 * 1024 * 1024  // 128 MiB minimum total upload per tier
+	speedtestTrialsPerLevel    = 2                  // run each tier twice, take the best
+	scalingGainThreshold       = 0.10               // 10% improvement needed to recommend more workers
+	stallThreshold             = 0.05               // 5% improvement threshold for early stopping
+	stallCountForStop          = 2                   // consecutive stalled levels before stopping
 )
 
-var scalingLevels = []int{1, 2, 4, 8, 16, 32}
+var scalingLevels = []int{1, 2, 4, 8, 16, 32, 64, 128}
 
 // ScalingPoint records aggregate throughput at a given concurrency level.
 type ScalingPoint struct {
@@ -97,7 +100,7 @@ func runSpeedtest(cfg *Config) error {
 		return fmt.Errorf("create wasabi client: %w", err)
 	}
 
-	gcsClient, err := newGCSClient(ctx)
+	gcsClient, err := newGCSClient(ctx, cfg.Workers)
 	if err != nil {
 		return fmt.Errorf("create gcs client: %w", err)
 	}
@@ -155,16 +158,40 @@ func runSpeedtest(cfg *Config) error {
 	return nil
 }
 
-// runScalingSweep tests Wasabi download and GCS upload throughput at increasing
-// concurrency levels and prints a table as each level completes.
-func runScalingSweep(ctx context.Context, results *SpeedtestResults, wasabiClient *s3.Client, gcsClient *storage.Client, cfg *Config) {
-	perWorkerDown := int64(speedtestPerWorkerDownload)
-	if results.TestObjectSize > 0 && perWorkerDown > results.TestObjectSize {
-		perWorkerDown = results.TestObjectSize
+// scaledPerWorker returns the per-worker byte count for a given tier, ensuring
+// the total transfer volume meets a minimum so each measurement runs long enough
+// to produce stable results. The result is capped at maxPerWorker (e.g. test object size).
+func scaledPerWorker(base, minTotal, maxPerWorker int64, workers int) int64 {
+	perWorker := base
+	if minFloor := minTotal / int64(workers); minFloor > perWorker {
+		perWorker = minFloor
 	}
+	if maxPerWorker > 0 && perWorker > maxPerWorker {
+		perWorker = maxPerWorker
+	}
+	return perWorker
+}
 
+// runScalingSweep tests Wasabi download and GCS upload throughput at increasing
+// concurrency levels and prints a table as each level completes. Each tier is
+// run multiple times and the best result is kept to reduce noise from transient
+// network hiccups.
+func runScalingSweep(ctx context.Context, results *SpeedtestResults, wasabiClient *s3.Client, gcsClient *storage.Client, cfg *Config) {
 	hasWasabi := results.WasabiSkipReason == ""
 	hasGCS := results.GCSSkipReason == ""
+
+	// Warmup: prime DNS, TLS sessions, and connection pools before timing
+	fmt.Fprintf(os.Stderr, "  %s", dimStyle.Render("Warming up connections... "))
+	if hasWasabi {
+		_, _ = testWasabiAtConcurrency(ctx, wasabiClient,
+			cfg.WasabiBucket, results.TestObjectKey, 1*1024*1024, 1)
+	}
+	if hasGCS {
+		_, _ = testGCSAtConcurrency(ctx, gcsClient,
+			cfg.GCSBucket, 1*1024*1024, 1)
+	}
+	fmt.Fprintln(os.Stderr, dimStyle.Render("done"))
+	fmt.Fprintln(os.Stderr)
 
 	fmt.Fprintln(os.Stderr, "  "+titleStyle.Render("Worker Scaling"))
 	fmt.Fprintln(os.Stderr)
@@ -185,27 +212,36 @@ func runScalingSweep(ctx context.Context, results *SpeedtestResults, wasabiClien
 	for _, n := range scalingLevels {
 		var wasabiBPS, gcsBPS float64
 
-		// Test Wasabi download at this concurrency
-		if hasWasabi {
-			bps, err := testWasabiAtConcurrency(ctx, wasabiClient,
-				cfg.WasabiBucket, results.TestObjectKey, perWorkerDown, n)
-			if err != nil {
-				hasWasabi = false
-				results.WasabiSkipReason = err.Error()
-			} else {
-				wasabiBPS = bps
-			}
+		// Compute per-worker sizes for this tier
+		maxDown := int64(speedtestMaxObject)
+		if results.TestObjectSize > 0 && results.TestObjectSize < maxDown {
+			maxDown = results.TestObjectSize
 		}
+		perWorkerDown := scaledPerWorker(speedtestPerWorkerDownload, speedtestMinTotalDownload, maxDown, n)
+		perWorkerUp := scaledPerWorker(speedtestPerWorkerUpload, speedtestMinTotalUpload, 0, n)
 
-		// Test GCS upload at this concurrency
-		if hasGCS {
-			bps, err := testGCSAtConcurrency(ctx, gcsClient,
-				cfg.GCSBucket, int64(speedtestPerWorkerUpload), n)
-			if err != nil {
-				hasGCS = false
-				results.GCSSkipReason = err.Error()
-			} else {
-				gcsBPS = bps
+		// Run multiple trials, keep the best result
+		for trial := 0; trial < speedtestTrialsPerLevel; trial++ {
+			if hasWasabi {
+				bps, err := testWasabiAtConcurrency(ctx, wasabiClient,
+					cfg.WasabiBucket, results.TestObjectKey, perWorkerDown, n)
+				if err != nil {
+					hasWasabi = false
+					results.WasabiSkipReason = err.Error()
+				} else if bps > wasabiBPS {
+					wasabiBPS = bps
+				}
+			}
+
+			if hasGCS {
+				bps, err := testGCSAtConcurrency(ctx, gcsClient,
+					cfg.GCSBucket, perWorkerUp, n)
+				if err != nil {
+					hasGCS = false
+					results.GCSSkipReason = err.Error()
+				} else if bps > gcsBPS {
+					gcsBPS = bps
+				}
 			}
 		}
 

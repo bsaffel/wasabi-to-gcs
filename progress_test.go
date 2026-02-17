@@ -74,12 +74,12 @@ func TestFormatSize(t *testing.T) {
 		bytes float64
 		want  string
 	}{
-		{"zero bytes", 0, "0 B"},
-		{"small bytes", 512, "512 B"},
-		{"one KiB", 1024, "1.0 KiB"},
-		{"one MiB", 1024 * 1024, "1.0 MiB"},
-		{"one GiB", 1024 * 1024 * 1024, "1.0 GiB"},
-		{"mixed MiB", 1.5 * 1024 * 1024, "1.5 MiB"},
+		{"zero bytes", 0, "       0 B"},
+		{"small bytes", 512, "     512 B"},
+		{"one KiB", 1024, "   1.0 KiB"},
+		{"one MiB", 1024 * 1024, "   1.0 MiB"},
+		{"one GiB", 1024 * 1024 * 1024, "   1.0 GiB"},
+		{"mixed MiB", 1.5 * 1024 * 1024, "   1.5 MiB"},
 	}
 
 	for _, tt := range tests {

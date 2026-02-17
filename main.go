@@ -236,7 +236,7 @@ func registerFlags(cmd *cobra.Command, cfg *Config, logLevel *string) {
 
 	// Transfer Options
 	f.StringVar(&cfg.Prefix, "prefix", "", "Only migrate objects with this key prefix (e.g. \"images/\")")
-	f.IntVarP(&cfg.Workers, "workers", "w", 10, "Number of concurrent transfer workers (1-100)")
+	f.IntVarP(&cfg.Workers, "workers", "w", 10, "Number of concurrent transfer workers (1-128)")
 	f.IntVar(&cfg.MaxRetries, "max-retries", 3, "Max retry attempts per failed object (0-10)")
 	f.StringVar(&cfg.StateDir, "state-dir", "./migration_state", "Directory for tracking resume state between runs")
 	f.BoolVarP(&cfg.DryRun, "dry-run", "n", false, "Scan and count objects without transferring anything")
@@ -326,8 +326,9 @@ func runMigration(cfg *Config) error {
 	// Library code (GCS SDK, gRPC) writes to stderr via log.Print and
 	// grpclog during connection establishment, which shifts mpb's cursor
 	// tracking and leaves ghost progress bar lines at the top of the display.
+	// Send gRPC noise to /dev/null so it doesn't pollute the migration log.
 	log.SetOutput(logFile)
-	grpclog.SetLoggerV2(grpclog.NewLoggerV2(logFile, logFile, logFile))
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
 
 	printBanner(cfg)
 
@@ -383,22 +384,27 @@ func runMigration(cfg *Config) error {
 		return fmt.Errorf("create wasabi client: %w", err)
 	}
 
-	gcsClient, err := newGCSClient(ctx)
+	gcsClient, err := newGCSClient(ctx, cfg.Workers)
 	if err != nil {
 		return fmt.Errorf("create gcs client: %w", err)
 	}
 	defer gcsClient.Close()
 
-	// Redirect stderr (fd 2) to the log file so library writes (gRPC
+	// Redirect stderr (fd 2) to /dev/null so library writes (gRPC
 	// connection setup, GCS SDK diagnostics) can't corrupt mpb's ANSI cursor
-	// tracking. mpb draws to the saved terminal fd instead.
+	// tracking or pollute the migration log. mpb draws to the saved terminal fd.
 	termFd, err := syscall.Dup(int(os.Stderr.Fd()))
 	if err != nil {
 		return fmt.Errorf("dup stderr: %w", err)
 	}
 	terminal := os.NewFile(uintptr(termFd), "/dev/stderr")
 	defer terminal.Close()
-	syscall.Dup2(int(logFile.Fd()), int(os.Stderr.Fd()))
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open /dev/null: %w", err)
+	}
+	syscall.Dup2(int(devNull.Fd()), int(os.Stderr.Fd()))
+	devNull.Close()
 	restoreStderr := func() {
 		syscall.Dup2(termFd, int(os.Stderr.Fd()))
 	}
@@ -684,6 +690,17 @@ func printCompletionSummary(stats ProgressStats, lister *Lister, startTime time.
 		valueStyle.Render(fmt.Sprintf("%.1f MB/s", avgSpeed)))
 
 	fmt.Fprintln(os.Stderr)
+
+	// Print details for each failed file so the user can see the actual errors
+	if len(stats.Failed) > 0 {
+		fmt.Fprintln(os.Stderr, errorStyle.Render("Failed Files"))
+		fmt.Fprintln(os.Stderr)
+		for _, f := range stats.Failed {
+			fmt.Fprintf(os.Stderr, "  %s %s\n", errorStyle.Render("*"), valueStyle.Render(f.Key))
+			fmt.Fprintf(os.Stderr, "    %s\n", dimStyle.Render(f.Err))
+		}
+		fmt.Fprintln(os.Stderr)
+	}
 }
 
 func printStyledError(err error) {

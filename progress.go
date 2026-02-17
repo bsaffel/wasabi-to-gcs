@@ -5,6 +5,8 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,8 +17,13 @@ import (
 // barState holds per-bar timing state captured in closures so that
 // reuse of the same workerID slot does not corrupt a previous bar's display.
 type barState struct {
-	startTime time.Time
-	elapsedNs atomic.Int64 // frozen on completion
+	startTime  time.Time
+	elapsedNs  atomic.Int64          // frozen on completion
+	seqNum     atomic.Int64          // assigned on completion, displayed as line number
+	retryCount atomic.Int32          // current retry attempt (0 = first try)
+	failed     atomic.Bool           // true after all retries exhausted
+	errMsg     atomic.Pointer[string] // set once on failure, read by decorator
+	streamed   atomic.Int64          // bytes read through this bar's counting reader
 }
 
 // ProgressReporter manages per-file and overall progress bars via mpb.
@@ -30,6 +37,14 @@ type ProgressReporter struct {
 	currentState []*barState   // indexed by workerID, timing state for active bar
 	numWorkers   int
 	barCounter   atomic.Int64 // incrementing priority for new file bars
+	completionSeq atomic.Int64 // incrementing sequence assigned at completion time
+
+	failedBars   []*mpb.Bar  // bars for failed transfers, completed at end
+	failedStates []*barState // corresponding states
+	failedMu     sync.Mutex  // protects failedBars/failedStates
+
+	failedDetails []FailedFile // full error details for summary
+	failedDetMu   sync.Mutex   // protects failedDetails
 
 	scanComplete   atomic.Bool
 	totalObjects   atomic.Int64
@@ -44,11 +59,18 @@ type ProgressReporter struct {
 	logger           *slog.Logger
 }
 
+// FailedFile records a file that failed to transfer, with its full error.
+type FailedFile struct {
+	Key string
+	Err string
+}
+
 // ProgressStats holds current progress statistics.
 type ProgressStats struct {
 	CompletedFiles int64
 	CompletedBytes int64
 	FailedFiles    int64
+	Failed         []FailedFile
 }
 
 // NewProgressReporter creates a progress reporter with an overall bar.
@@ -100,7 +122,7 @@ func NewProgressReporter(logger *slog.Logger, verbose bool, numWorkers int, outp
 					return "-- MiB/s"
 				}
 				speed := float64(streamed) / elapsed / (1024 * 1024)
-				return fmt.Sprintf("%.1f MiB/s", speed)
+				return fmt.Sprintf("%6.1f MiB/s", speed)
 			}, decor.WCSyncSpace),
 			decor.Any(func(s decor.Statistics) string {
 				elapsed := time.Since(pr.startTime)
@@ -156,8 +178,9 @@ func (pr *ProgressReporter) ScanComplete() {
 }
 
 // StartTransfer creates a new per-file progress bar for the transfer.
-// The bar persists at 100% after completion via mpb's auto-complete
-// (triggerComplete=true when total > 0).
+// The bar is created with total=0 (triggerComplete=false) so that the
+// barCountingReader filling it to 100% does NOT auto-complete/pop it.
+// Only CompleteTransfer triggers completion after assigning the sequence number.
 func (pr *ProgressReporter) StartTransfer(workerID int, job ObjectJob) {
 	if workerID < 0 || workerID >= pr.numWorkers {
 		return
@@ -172,21 +195,47 @@ func (pr *ProgressReporter) StartTransfer(workerID int, job ObjectJob) {
 	bs := &barState{startTime: time.Now()}
 	pr.currentState[workerID] = bs
 
-	bar := pr.container.New(job.Size,
-		mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding(" ").Rbound("]"),
+	// Build the normal bar filler for non-failed state.
+	normalFiller := mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding(" ").Rbound("]").Build()
+
+	// Create with total=0 so triggerComplete defaults to false, preventing
+	// auto-completion when barCountingReader fills the bar to 100%.
+	// Use BarFillerFunc so failed bars replace the visual bar with an error message.
+	bar, _ := pr.container.Add(0,
+		mpb.BarFillerFunc(func(w io.Writer, st decor.Statistics) error {
+			if bs.failed.Load() {
+				msg := "FAILED"
+				if m := bs.errMsg.Load(); m != nil {
+					msg = "FAILED: " + *m
+				}
+				availW := st.AvailableWidth
+				if availW > 0 && len(msg) > availW {
+					msg = msg[:availW-3] + "..."
+				}
+				fmt.Fprintf(w, "%-*s", availW, msg)
+				return nil
+			}
+			return normalFiller.Fill(w, st)
+		}),
 		mpb.BarPriority(priority),
 		mpb.PrependDecorators(
-			decor.Name("  "+displayName+" ", decor.WCSyncSpaceR),
+			decor.Any(func(s decor.Statistics) string {
+				if bs.failed.Load() {
+					return fmt.Sprintf(" ERR  %s ", displayName)
+				}
+				if n := bs.seqNum.Load(); n > 0 {
+					return fmt.Sprintf("%4d  %s ", n, displayName)
+				}
+				return fmt.Sprintf("      %s ", displayName)
+			}, decor.WCSyncSpaceR),
 		),
 		mpb.AppendDecorators(
 			decor.Any(func(s decor.Statistics) string {
-				// Check for frozen elapsed time, or freeze it now if bar
-				// auto-completed (via barCountingReader) before CompleteTransfer ran.
-				frozenNs := bs.elapsedNs.Load()
-				if frozenNs == 0 && s.Completed {
-					frozenNs = int64(time.Since(bs.startTime))
-					bs.elapsedNs.CompareAndSwap(0, frozenNs)
+				// Failed: error message is rendered in the bar area, nothing here
+				if bs.failed.Load() {
+					return ""
 				}
+				frozenNs := bs.elapsedNs.Load()
 				if frozenNs > 0 {
 					// Completed: show percentage, total size, elapsed time, effective speed
 					pct := float64(0)
@@ -199,36 +248,45 @@ func (pr *ProgressReporter) StartTransfer(workerID int, job ObjectJob) {
 					if elapsed > 0 {
 						speed = size / elapsed.Seconds()
 					}
-					return fmt.Sprintf("%.0f%%  %s  %s  %s/s",
+					return fmt.Sprintf("%3.0f%%  %s  %5s  %s/s",
 						pct,
 						formatSize(size),
 						formatDuration(elapsed),
 						formatSize(speed),
 					)
 				}
-				// In-progress: show percentage, current/total, and speed
+				// In-progress: show percentage, current/total, speed, and retry info
 				pct := float64(0)
 				if s.Total > 0 {
 					pct = float64(s.Current) / float64(s.Total) * 100
 				}
+				retryInfo := ""
+				if r := bs.retryCount.Load(); r > 0 {
+					retryInfo = fmt.Sprintf("  (retry %d)", r)
+				}
 				elapsed := time.Since(bs.startTime).Seconds()
 				if elapsed >= 1 && s.Current > 0 {
 					speed := float64(s.Current) / elapsed
-					return fmt.Sprintf("%.0f%%  %s / %s  %s/s",
+					return fmt.Sprintf("%3.0f%%  %s / %s  %s/s%s",
 						pct,
 						formatSize(float64(s.Current)),
 						formatSize(float64(s.Total)),
 						formatSize(speed),
+						retryInfo,
 					)
 				}
-				return fmt.Sprintf("%.0f%%  %s / %s",
+				return fmt.Sprintf("%3.0f%%  %s / %s%s",
 					pct,
 					formatSize(float64(s.Current)),
 					formatSize(float64(s.Total)),
+					retryInfo,
 				)
 			}, decor.WCSyncSpace),
 		),
 	)
+
+	// Set the real total without triggering completion (false).
+	bar.SetTotal(job.Size, false)
 
 	pr.currentBars[workerID] = bar
 }
@@ -238,9 +296,11 @@ func (pr *ProgressReporter) CompleteTransfer(workerID int, job ObjectJob) {
 	if workerID >= 0 && workerID < pr.numWorkers {
 		bar := pr.currentBars[workerID]
 		if bar != nil {
-			// Freeze elapsed time before completing so the decorator shows a stable value.
 			bs := pr.currentState[workerID]
 			if bs != nil {
+				// Assign completion sequence number and freeze elapsed time
+				// before triggering bar completion, so the final render shows both.
+				bs.seqNum.Store(pr.completionSeq.Add(1))
 				bs.elapsedNs.CompareAndSwap(0, int64(time.Since(bs.startTime)))
 			}
 			// Ensure bar shows exactly 100%. PopCompletedMode on the
@@ -259,17 +319,77 @@ func (pr *ProgressReporter) CompleteTransfer(workerID int, job ObjectJob) {
 	pr.completedFiles.Add(1)
 }
 
-// FailTransfer removes the per-file bar and increments the failure counter.
+// FailTransfer marks a per-file bar as failed. The bar stays active (not popped)
+// so it renders below completed bars. It will be completed in Complete() so that
+// error lines appear at the bottom of the scrollback, below all successful transfers.
 func (pr *ProgressReporter) FailTransfer(workerID int, job ObjectJob, err error) {
 	if workerID >= 0 && workerID < pr.numWorkers {
 		bar := pr.currentBars[workerID]
-		if bar != nil {
+		bs := pr.currentState[workerID]
+		if bar != nil && bs != nil {
+			// Set error state — decorators will switch to showing error info.
+			// Strip wrapping that includes the key name (e.g. "non-retryable
+			// error for <key>: ..." or "all N attempts failed for <key>: ...")
+			// since the key is already shown in the prepend decorator.
+			errStr := err.Error()
+			if idx := strings.Index(errStr, job.Key+": "); idx >= 0 {
+				errStr = errStr[idx+len(job.Key)+2:]
+			}
+			if len(errStr) > 80 {
+				errStr = errStr[:77] + "..."
+			}
+			bs.errMsg.Store(&errStr)
+			bs.failed.Store(true)
+
+			// Undo streamed bytes from this failed transfer so overall
+			// speed/ETA calculations remain accurate.
+			prev := bs.streamed.Swap(0)
+			pr.streamedBytes.Add(-prev)
+
+			// Reset bar to empty so it shows as [ ] not partially filled
+			bar.SetCurrent(0)
+
+			// Move bar to failed tracking — frees the workerID slot for reuse
+			pr.failedMu.Lock()
+			pr.failedBars = append(pr.failedBars, bar)
+			pr.failedStates = append(pr.failedStates, bs)
+			pr.failedMu.Unlock()
+		} else if bar != nil {
 			bar.Abort(true)
-			pr.currentBars[workerID] = nil
 		}
+		pr.currentBars[workerID] = nil
+		pr.currentState[workerID] = nil
 	}
 
 	pr.failedFiles.Add(1)
+
+	// Record full error for the completion summary
+	pr.failedDetMu.Lock()
+	pr.failedDetails = append(pr.failedDetails, FailedFile{Key: job.Key, Err: err.Error()})
+	pr.failedDetMu.Unlock()
+}
+
+// RetryTransfer resets a per-file bar for a retry attempt. It undoes the
+// streamed byte count from the previous attempt and resets the bar position
+// so the progress display is accurate for the new attempt.
+func (pr *ProgressReporter) RetryTransfer(workerID int, attempt int) {
+	if workerID < 0 || workerID >= pr.numWorkers {
+		return
+	}
+	bar := pr.currentBars[workerID]
+	bs := pr.currentState[workerID]
+	if bar == nil || bs == nil {
+		return
+	}
+
+	// Undo streamed bytes from previous attempt
+	prev := bs.streamed.Swap(0)
+	pr.streamedBytes.Add(-prev)
+
+	// Reset bar position and update retry count
+	bar.SetCurrent(0)
+	bs.retryCount.Store(int32(attempt))
+	bs.startTime = time.Now()
 }
 
 // barCountingReader wraps an io.Reader and increments an mpb bar on each read.
@@ -278,6 +398,7 @@ func (pr *ProgressReporter) FailTransfer(workerID int, job ObjectJob, err error)
 type barCountingReader struct {
 	r  io.Reader
 	bar *mpb.Bar
+	bs  *barState
 	pr  *ProgressReporter
 }
 
@@ -285,6 +406,7 @@ func (cr *barCountingReader) Read(p []byte) (int, error) {
 	n, err := cr.r.Read(p)
 	if n > 0 {
 		cr.bar.IncrBy(n)
+		cr.bs.streamed.Add(int64(n))
 		cr.pr.streamedBytes.Add(int64(n))
 	}
 	return n, err
@@ -297,11 +419,12 @@ func (pr *ProgressReporter) WrapReader(r io.Reader, workerID int) io.Reader {
 	}
 
 	bar := pr.currentBars[workerID]
-	if bar == nil {
+	bs := pr.currentState[workerID]
+	if bar == nil || bs == nil {
 		return r
 	}
 
-	return &barCountingReader{r: r, bar: bar, pr: pr}
+	return &barCountingReader{r: r, bar: bar, bs: bs, pr: pr}
 }
 
 // ReportError logs an error to the structured logger.
@@ -314,7 +437,8 @@ func (pr *ProgressReporter) ReportError(key string, err error) {
 }
 
 // Complete marks the overall bar as finished so that container.Wait() can return.
-// Any still-active file bars are aborted to clean them up.
+// Failed bars are completed last so they appear at the bottom of the scrollback,
+// below all successful transfers. Any other still-active bars are aborted.
 func (pr *ProgressReporter) Complete() {
 	for i, bar := range pr.currentBars {
 		if bar != nil {
@@ -322,6 +446,23 @@ func (pr *ProgressReporter) Complete() {
 			pr.currentBars[i] = nil
 		}
 	}
+
+	// Wait two render cycles so mpb pops all completed file bars to scrollback
+	// before we add the failed bars. Without this, ordering can be incorrect.
+	time.Sleep(350 * time.Millisecond)
+
+	// Complete failed bars — they pop to scrollback below all previously
+	// completed bars, creating a clear "errors at the bottom" layout.
+	pr.failedMu.Lock()
+	for _, bar := range pr.failedBars {
+		bar.SetTotal(0, true)
+	}
+	pr.failedBars = nil
+	pr.failedStates = nil
+	pr.failedMu.Unlock()
+
+	// Wait for failed bars to be popped before completing overall bar.
+	time.Sleep(350 * time.Millisecond)
 
 	pr.overallBar.SetTotal(pr.overallBar.Current(), true)
 }
@@ -331,18 +472,21 @@ func (pr *ProgressReporter) Wait() {
 	pr.container.Wait()
 }
 
-// formatSize returns a human-readable size string using binary units (KiB, MiB, GiB).
+// formatSize returns a fixed-width (9 char) human-readable size string using
+// binary units (KiB, MiB, GiB). Right-aligned for consistent column alignment.
 func formatSize(bytes float64) string {
+	var s string
 	switch {
 	case bytes >= 1024*1024*1024:
-		return fmt.Sprintf("%.1f GiB", bytes/(1024*1024*1024))
+		s = fmt.Sprintf("%.1f GiB", bytes/(1024*1024*1024))
 	case bytes >= 1024*1024:
-		return fmt.Sprintf("%.1f MiB", bytes/(1024*1024))
+		s = fmt.Sprintf("%.1f MiB", bytes/(1024*1024))
 	case bytes >= 1024:
-		return fmt.Sprintf("%.1f KiB", bytes/1024)
+		s = fmt.Sprintf("%.1f KiB", bytes/1024)
 	default:
-		return fmt.Sprintf("%.0f B", bytes)
+		s = fmt.Sprintf("%.0f B", bytes)
 	}
+	return fmt.Sprintf("%10s", s)
 }
 
 // formatDuration returns a compact duration string using colon notation (e.g. "1:23", "0:45", "2:05:00").
@@ -365,9 +509,15 @@ func formatDuration(d time.Duration) string {
 
 // Stats returns current progress statistics.
 func (pr *ProgressReporter) Stats() ProgressStats {
+	pr.failedDetMu.Lock()
+	failed := make([]FailedFile, len(pr.failedDetails))
+	copy(failed, pr.failedDetails)
+	pr.failedDetMu.Unlock()
+
 	return ProgressStats{
 		CompletedFiles: pr.completedFiles.Load(),
 		CompletedBytes: pr.completedBytes.Load(),
 		FailedFiles:    pr.failedFiles.Load(),
+		Failed:         failed,
 	}
 }

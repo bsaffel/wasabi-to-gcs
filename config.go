@@ -71,8 +71,8 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("gcs-bucket is required"))
 	}
 
-	if c.Workers < 1 || c.Workers > 100 {
-		errs = append(errs, fmt.Errorf("workers must be 1-100, got %d", c.Workers))
+	if c.Workers < 1 || c.Workers > 128 {
+		errs = append(errs, fmt.Errorf("workers must be 1-128, got %d", c.Workers))
 	}
 	if c.MaxRetries < 0 || c.MaxRetries > 10 {
 		errs = append(errs, fmt.Errorf("max-retries must be 0-10, got %d", c.MaxRetries))

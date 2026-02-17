@@ -71,10 +71,20 @@ func newWasabiClient(ctx context.Context, cfg *Config) (*s3.Client, error) {
 	}), nil
 }
 
-// newGCSClient creates a GCS client with gRPC connection pooling.
-func newGCSClient(ctx context.Context) (*storage.Client, error) {
+// gcsConnectionPool returns the gRPC connection pool size for the given worker count.
+// gRPC multiplexes streams over connections, so 1 connection per ~8 workers is sufficient.
+func gcsConnectionPool(workers int) int {
+	pool := workers / 8
+	if pool < 4 {
+		pool = 4
+	}
+	return pool
+}
+
+// newGCSClient creates a GCS client with gRPC connection pooling scaled to worker count.
+func newGCSClient(ctx context.Context, workers int) (*storage.Client, error) {
 	client, err := storage.NewGRPCClient(ctx,
-		option.WithGRPCConnectionPool(4),
+		option.WithGRPCConnectionPool(gcsConnectionPool(workers)),
 		storage.WithDisabledClientMetrics(),
 	)
 	if err != nil {
