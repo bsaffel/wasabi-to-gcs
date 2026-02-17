@@ -63,6 +63,7 @@ func NewProgressReporter(logger *slog.Logger, verbose bool, numWorkers int, outp
 	container := mpb.New(
 		mpb.WithOutput(output),
 		mpb.WithRefreshRate(150*time.Millisecond),
+		mpb.PopCompletedMode(),
 	)
 
 	pr := &ProgressReporter{
@@ -242,7 +243,9 @@ func (pr *ProgressReporter) CompleteTransfer(workerID int, job ObjectJob) {
 			if bs != nil {
 				bs.elapsedNs.CompareAndSwap(0, int64(time.Since(bs.startTime)))
 			}
-			// Ensure bar shows exactly 100%.
+			// Ensure bar shows exactly 100%. PopCompletedMode on the
+			// container moves completed bars out of the active render area
+			// into static scrollback, so each file appears once.
 			bar.SetCurrent(job.Size)
 			bar.SetTotal(job.Size, true)
 			pr.currentBars[workerID] = nil

@@ -91,12 +91,19 @@ func init() {
 			if !ok || len(ann) == 0 || ann[0] != group {
 				return
 			}
-			fmt.Fprintf(&buf, "      --%s", f.Name)
+			if f.Shorthand != "" {
+				fmt.Fprintf(&buf, "  -%s, --%s", f.Shorthand, f.Name)
+			} else {
+				fmt.Fprintf(&buf, "      --%s", f.Name)
+			}
 			varType, usage := pflag.UnquoteUsage(f)
 			if varType != "" {
 				fmt.Fprintf(&buf, " %s", varType)
 			}
 			padding := 30 - len(f.Name)
+			if f.Shorthand != "" {
+				padding -= 4 // account for "-x, " prefix
+			}
 			if varType != "" {
 				padding -= len(varType) + 1
 			}
@@ -215,30 +222,30 @@ func registerFlags(cmd *cobra.Command, cfg *Config, logLevel *string) {
 	f := cmd.Flags()
 
 	// Source (Wasabi)
-	f.StringVar(&cfg.WasabiEndpoint, "wasabi-endpoint", "", "Wasabi S3 endpoint URL")
-	f.StringVar(&cfg.WasabiRegion, "wasabi-region", "", "Wasabi region (e.g. us-east-1)")
+	f.StringVar(&cfg.WasabiEndpoint, "wasabi-endpoint", "", "Wasabi S3 endpoint URL (e.g. https://s3.us-east-1.wasabisys.com)")
+	f.StringVar(&cfg.WasabiRegion, "wasabi-region", "", "Wasabi region name (e.g. us-east-1)")
 	f.StringVar(&cfg.WasabiAccessKey, "wasabi-access-key", "",
-		"Wasabi access key [$WASABI_ACCESS_KEY]")
+		"Wasabi access key ID [$WASABI_ACCESS_KEY]")
 	f.StringVar(&cfg.WasabiSecretKey, "wasabi-secret-key", "",
-		"Wasabi secret key [$WASABI_SECRET_KEY]")
-	f.StringVar(&cfg.WasabiBucket, "wasabi-bucket", "", "Source Wasabi bucket name")
+		"Wasabi secret access key [$WASABI_SECRET_KEY]")
+	f.StringVar(&cfg.WasabiBucket, "wasabi-bucket", "", "Source bucket name in Wasabi")
 
 	// Destination (GCS)
-	f.StringVar(&cfg.GCSProject, "gcs-project", "", "GCP project ID (optional)")
-	f.StringVar(&cfg.GCSBucket, "gcs-bucket", "", "Destination GCS bucket name")
+	f.StringVar(&cfg.GCSProject, "gcs-project", "", "GCP project ID (auto-detected if omitted)")
+	f.StringVar(&cfg.GCSBucket, "gcs-bucket", "", "Destination bucket name in GCS")
 
 	// Transfer Options
-	f.StringVar(&cfg.Prefix, "prefix", "", "Only migrate objects matching this key prefix")
-	f.IntVar(&cfg.Workers, "workers", 10, "Number of concurrent transfer workers (1-100)")
-	f.IntVar(&cfg.MaxRetries, "max-retries", 3, "Max retry attempts per object (0-10)")
-	f.StringVar(&cfg.StateDir, "state-dir", "./migration_state", "Directory for resumable state tracking")
-	f.BoolVar(&cfg.DryRun, "dry-run", false, "Scan and count objects without transferring")
-	f.BoolVar(&cfg.Speedtest, "speedtest", false, "Profile Wasabi/GCS throughput and identify bottleneck")
-	f.BoolVar(&cfg.Rescan, "rescan", false, "Force re-scan of source bucket, ignore cached manifest")
-	f.BoolVar(&cfg.Force, "force", false, "Force restart of a completed migration")
+	f.StringVar(&cfg.Prefix, "prefix", "", "Only migrate objects with this key prefix (e.g. \"images/\")")
+	f.IntVarP(&cfg.Workers, "workers", "w", 10, "Number of concurrent transfer workers (1-100)")
+	f.IntVar(&cfg.MaxRetries, "max-retries", 3, "Max retry attempts per failed object (0-10)")
+	f.StringVar(&cfg.StateDir, "state-dir", "./migration_state", "Directory for tracking resume state between runs")
+	f.BoolVarP(&cfg.DryRun, "dry-run", "n", false, "Scan and count objects without transferring anything")
+	f.BoolVar(&cfg.Speedtest, "speedtest", false, "Run throughput benchmark to find optimal worker count")
+	f.BoolVar(&cfg.Rescan, "rescan", false, "Re-scan source bucket instead of using cached manifest")
+	f.BoolVar(&cfg.Force, "force", false, "Restart a migration that was previously marked complete")
 
 	// Output
-	f.BoolVar(&cfg.Verbose, "verbose", false, "Show structured log output alongside progress bars")
+	f.BoolVarP(&cfg.Verbose, "verbose", "v", false, "Show structured log output alongside progress bars")
 	f.StringVar(logLevel, "log-level", "info", "Log verbosity: debug, info, warn, error")
 
 	// Group annotations for custom help template

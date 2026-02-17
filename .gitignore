@@ -1,5 +1,6 @@
 # Binary
 wasabi-to-gcs
+wasabi-to-gcs-linux
 
 # Go build artifacts
 *.exe

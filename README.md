@@ -254,6 +254,64 @@ make tidy             # go mod tidy
 make clean            # Remove build artifacts
 ```
 
+## Running on a GCP VM
+
+Running this tool on a GCP VM gives 10–50x faster transfers compared to a home network. Instead of being bottlenecked by residential upload speeds (e.g. 14 Mbps), a VM in the same region as your GCS bucket gets multi-Gbps cloud-to-cloud throughput.
+
+### Prerequisites
+
+- **`gcloud` CLI** installed and configured (`gcloud auth login`)
+- **`WASABI_ACCESS_KEY`** and **`WASABI_SECRET_KEY`** exported in your local shell
+
+### Workflow
+
+```bash
+# 1. Build the Linux binary
+make build-linux
+
+# 2. Create a VM and deploy the binary + credentials + state
+make deploy
+
+# 3. SSH into the VM
+make ssh
+
+# 4. On the VM: run the migration
+source ~/.env
+./wasabi-to-gcs-linux \
+  --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
+  --wasabi-region us-east-1 \
+  --wasabi-bucket my-source \
+  --gcs-bucket my-destination \
+  --workers 20
+
+# 5. When done, delete the VM
+make teardown
+```
+
+### Overriding VM Settings
+
+The defaults are `VM_NAME=wasabi-migrator`, `VM_ZONE=us-east1-b`, `VM_TYPE=e2-standard-2`. Override any of them:
+
+```bash
+make deploy VM_NAME=my-vm VM_ZONE=us-central1-a VM_TYPE=e2-standard-4
+make ssh VM_NAME=my-vm VM_ZONE=us-central1-a
+make teardown VM_NAME=my-vm VM_ZONE=us-central1-a
+```
+
+### Tip: Use tmux for Long Migrations
+
+Start a `tmux` session so the migration keeps running if you disconnect:
+
+```bash
+# On the VM after make ssh:
+tmux new -s migrate
+source ~/.env
+./wasabi-to-gcs-linux --wasabi-endpoint ... --gcs-bucket ...
+
+# Detach: Ctrl-b d
+# Reconnect later: make ssh, then tmux attach -t migrate
+```
+
 ## Authentication
 
 ### Wasabi
