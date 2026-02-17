@@ -7,8 +7,9 @@ Migrations are **resumable** and **idempotent** — interrupted runs pick up exa
 ## Features
 
 - **Streaming transfers** — objects flow directly from Wasabi to GCS with no intermediate disk I/O
-- **Concurrent workers** — configurable parallelism (1–100 workers) for maximum throughput
+- **Concurrent workers** — configurable parallelism (1–128 workers) for maximum throughput
 - **Resumable migrations** — append-only state log tracks completed objects; interrupted runs resume seamlessly
+- **Cloud-backed state** — optionally sync state to GCS (`--state-gcs`) so migrations can resume across VM teardown/redeploy cycles
 - **MD5 integrity verification** — every object's checksum is validated after transfer; corrupt uploads are automatically deleted
 - **Real-time progress bars** — per-file and overall progress with transfer speeds, ETA, and byte counts
 - **Speedtest mode** — profiles Wasabi download and GCS upload throughput at multiple concurrency levels, identifies the bottleneck, and recommends optimal worker count
@@ -84,9 +85,10 @@ wasabi-to-gcs [flags]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--prefix` | _(none)_ | Only migrate objects matching this key prefix |
-| `--workers` | `10` | Number of concurrent transfer workers (1–100) |
+| `--workers` | `10` | Number of concurrent transfer workers (1–128) |
 | `--max-retries` | `3` | Max retry attempts per object (0–10) |
 | `--state-dir` | `./migration_state` | Directory for resumable state tracking |
+| `--state-gcs` | _(none)_ | GCS location for persistent state (e.g. `gs://bucket/prefix/`) |
 | `--dry-run` | `false` | Scan and count objects without transferring |
 | `--speedtest` | `false` | Profile throughput and recommend optimal workers |
 | `--rescan` | `false` | Force re-scan of source bucket, ignore cached manifest |
@@ -194,12 +196,14 @@ graph TD
     WP["WorkerPool<br/><small>pool.go</small><br/><small>slot-based semaphore</small>"]
     TE["TransferEngine<br/><small>transfer.go</small><br/><small>Wasabi → GCS + MD5 verify</small>"]
     SM["StateManager<br/><small>state.go</small><br/><small>completed.log / manifest.json</small>"]
+    GS["GCSStateSync<br/><small>state_gcs.go</small><br/><small>cloud-backed state</small>"]
     PR["ProgressReporter<br/><small>progress.go</small><br/><small>mpb bars</small>"]
     LF["Log File<br/><small>migration.log</small>"]
 
     L -- "ObjectJob channel" --> WP
     WP --> TE
     TE --> SM
+    SM -. "periodic sync" .-> GS
     TE --> PR
     TE --> LF
 ```
@@ -215,6 +219,7 @@ graph TD
 | `pool.go` | Slot-based semaphore concurrency with errgroup; maps slot IDs to per-worker progress bars |
 | `transfer.go` | Streaming Wasabi-to-GCS transfer with MD5 verification, size checks, and exponential backoff |
 | `state.go` | Append-only `completed.log` (TSV) + `manifest.json` for scan totals; enables resumability |
+| `state_gcs.go` | Downloads/uploads state files to GCS for cross-VM resume; periodic sync every 30s + final upload on shutdown |
 | `progress.go` | mpb-based progress: overall bar + dynamic per-file bars; stderr redirection for clean output |
 | `speedtest.go` | Worker scaling analysis across concurrency levels with throughput measurement |
 
@@ -240,6 +245,21 @@ The state directory (`./migration_state` by default) contains:
 The state directory is what enables resumability. On subsequent runs, already-completed keys are skipped. If the bucket name or prefix changes, the cached manifest is automatically discarded.
 
 To start fresh, either delete the state directory or use `--force`.
+
+### Cloud-backed state with `--state-gcs`
+
+By default, state lives only on the local filesystem. If you're running on ephemeral VMs, use `--state-gcs` to persist state to a GCS bucket:
+
+```bash
+wasabi-to-gcs \
+  --wasabi-endpoint https://s3.us-east-1.wasabisys.com \
+  --wasabi-region us-east-1 \
+  --wasabi-bucket my-source \
+  --gcs-bucket my-destination \
+  --state-gcs gs://my-bucket/migration-state/
+```
+
+On startup, state files are downloaded from GCS into the local `--state-dir`. During the migration, state is synced to GCS every 30 seconds. On shutdown, a final sync ensures the remote state is up to date. This allows you to tear down a VM and resume the migration later on a new one.
 
 ## Development
 
