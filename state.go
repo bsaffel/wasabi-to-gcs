@@ -137,6 +137,15 @@ func (sm *StateManager) Reset() error {
 	return nil
 }
 
+// Flush syncs the state file to disk without closing it.
+func (sm *StateManager) Flush() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.file != nil {
+		sm.file.Sync()
+	}
+}
+
 // Close flushes and closes the state file.
 func (sm *StateManager) Close() error {
 	sm.mu.Lock()

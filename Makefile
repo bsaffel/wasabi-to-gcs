@@ -2,7 +2,8 @@
 
 VM_NAME  ?= wasabi-migrator
 VM_ZONE  ?= us-east1-b
-VM_TYPE  ?= e2-standard-2
+# VM_TYPE  ?= e2-standard-2   # cheap option for 8 workers
+VM_TYPE  ?= c4d-standard-4  # fast option for up to 32 workers
 
 .PHONY: help build build-linux run test test-race test-integration test-coverage lint tidy clean deploy redeploy ssh teardown
 

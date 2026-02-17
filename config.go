@@ -35,6 +35,7 @@ type Config struct {
 	Workers    int
 	MaxRetries int
 	StateDir   string
+	StateGCS   string
 	DryRun     bool
 	Speedtest  bool
 
@@ -81,6 +82,12 @@ func (c *Config) Validate() error {
 	if c.WasabiEndpoint != "" {
 		if _, err := url.Parse(c.WasabiEndpoint); err != nil {
 			errs = append(errs, fmt.Errorf("invalid wasabi-endpoint URL: %w", err))
+		}
+	}
+
+	if c.StateGCS != "" {
+		if _, _, err := ParseGCSURL(c.StateGCS); err != nil {
+			errs = append(errs, fmt.Errorf("invalid state-gcs: %w", err))
 		}
 	}
 

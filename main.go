@@ -239,6 +239,7 @@ func registerFlags(cmd *cobra.Command, cfg *Config, logLevel *string) {
 	f.IntVarP(&cfg.Workers, "workers", "w", 10, "Number of concurrent transfer workers (1-128)")
 	f.IntVar(&cfg.MaxRetries, "max-retries", 3, "Max retry attempts per failed object (0-10)")
 	f.StringVar(&cfg.StateDir, "state-dir", "./migration_state", "Directory for tracking resume state between runs")
+	f.StringVar(&cfg.StateGCS, "state-gcs", "", "GCS location for persistent state (e.g. gs://bucket/prefix/)")
 	f.BoolVarP(&cfg.DryRun, "dry-run", "n", false, "Scan and count objects without transferring anything")
 	f.BoolVar(&cfg.Speedtest, "speedtest", false, "Run throughput benchmark to find optimal worker count")
 	f.BoolVar(&cfg.Rescan, "rescan", false, "Re-scan source bucket instead of using cached manifest")
@@ -255,7 +256,7 @@ func registerFlags(cmd *cobra.Command, cfg *Config, logLevel *string) {
 	for _, name := range []string{"gcs-project", "gcs-bucket"} {
 		setFlagGroup(cmd, name, "destination")
 	}
-	for _, name := range []string{"prefix", "workers", "max-retries", "state-dir", "dry-run", "speedtest", "rescan", "force"} {
+	for _, name := range []string{"prefix", "workers", "max-retries", "state-dir", "state-gcs", "dry-run", "speedtest", "rescan", "force"} {
 		setFlagGroup(cmd, name, "transfer")
 	}
 	for _, name := range []string{"verbose", "log-level"} {
@@ -332,6 +333,20 @@ func runMigration(cfg *Config) error {
 
 	printBanner(cfg)
 
+	// Download state from GCS before loading local state
+	var gcsSync *GCSStateSync
+	if cfg.StateGCS != "" {
+		gcsSync, err = NewGCSStateSync(ctx, cfg.StateGCS, cfg.StateDir, logger)
+		if err != nil {
+			return fmt.Errorf("create gcs state sync: %w", err)
+		}
+		defer gcsSync.Close()
+
+		if err := gcsSync.Download(ctx); err != nil {
+			return fmt.Errorf("download state from GCS: %w", err)
+		}
+	}
+
 	state, err := NewStateManager(cfg.StateDir, logger)
 	if err != nil {
 		return fmt.Errorf("create state manager: %w", err)
@@ -376,6 +391,12 @@ func runMigration(cfg *Config) error {
 		} else {
 			printResumeInfo(manifest, state, cfg.Prefix)
 		}
+	}
+
+	// Start periodic state sync to GCS
+	if gcsSync != nil {
+		stopSync := gcsSync.StartPeriodicSync(ctx, 30*time.Second, state.Flush)
+		defer stopSync()
 	}
 
 	// Create clients
@@ -577,8 +598,15 @@ func printBanner(cfg *Config) {
 		fmt.Sprintf("  %s  %s",
 			labelStyle.Render("Log file:"),
 			dimStyle.Render(cfg.StateDir+"/migration.log")),
-		"",
 	}
+
+	if cfg.StateGCS != "" {
+		lines = append(lines, fmt.Sprintf("  %s  %s",
+			labelStyle.Render("State GCS:"),
+			dimStyle.Render(cfg.StateGCS)))
+	}
+
+	lines = append(lines, "")
 
 	fmt.Fprintln(os.Stderr, strings.Join(lines, "\n"))
 }
