@@ -205,6 +205,10 @@ migrations resume without re-transferring.`,
 				return runSpeedtest(cfg)
 			}
 
+			if cfg.Compare {
+				return runCompare(cfg)
+			}
+
 			return runMigration(cfg)
 		},
 	}
@@ -244,6 +248,8 @@ func registerFlags(cmd *cobra.Command, cfg *Config, logLevel *string) {
 	f.BoolVar(&cfg.Speedtest, "speedtest", false, "Run throughput benchmark to find optimal worker count")
 	f.BoolVar(&cfg.Rescan, "rescan", false, "Re-scan source bucket instead of using cached manifest")
 	f.BoolVar(&cfg.Force, "force", false, "Restart a migration that was previously marked complete")
+	f.BoolVar(&cfg.Compare, "compare", false, "Compare source and destination; print diff without transferring")
+	f.BoolVar(&cfg.CheckDestination, "check-destination", false, "Pre-scan GCS destination to skip already-transferred objects")
 
 	// Output
 	f.BoolVarP(&cfg.Verbose, "verbose", "v", false, "Show structured log output alongside progress bars")
@@ -256,7 +262,7 @@ func registerFlags(cmd *cobra.Command, cfg *Config, logLevel *string) {
 	for _, name := range []string{"gcs-project", "gcs-bucket"} {
 		setFlagGroup(cmd, name, "destination")
 	}
-	for _, name := range []string{"prefix", "workers", "max-retries", "state-dir", "state-gcs", "dry-run", "speedtest", "rescan", "force"} {
+	for _, name := range []string{"prefix", "workers", "max-retries", "state-dir", "state-gcs", "dry-run", "speedtest", "rescan", "force", "compare", "check-destination"} {
 		setFlagGroup(cmd, name, "transfer")
 	}
 	for _, name := range []string{"verbose", "log-level"} {
@@ -410,6 +416,24 @@ func runMigration(cfg *Config) error {
 		return fmt.Errorf("create gcs client: %w", err)
 	}
 	defer gcsClient.Close()
+
+	// Pre-scan GCS destination to skip already-transferred objects
+	if cfg.CheckDestination {
+		fmt.Fprintln(os.Stderr, dimStyle.Render("Pre-scanning GCS destination..."))
+		destObjects, err := listGCSObjects(ctx, gcsClient, cfg.GCSBucket, cfg.Prefix, nil)
+		if err != nil {
+			return fmt.Errorf("pre-scan destination: %w", err)
+		}
+		added := state.MarkMatchingAsCompleted(destObjects)
+		if added > 0 {
+			fmt.Fprintf(os.Stderr, "  %s %s\n\n",
+				successStyle.Render(fmt.Sprintf("%d", added)),
+				dimStyle.Render("objects already in destination, marked as completed"))
+		} else {
+			fmt.Fprintf(os.Stderr, "  %s\n\n",
+				dimStyle.Render("no new objects found in destination"))
+		}
+	}
 
 	// Redirect stderr (fd 2) to /dev/null so library writes (gRPC
 	// connection setup, GCS SDK diagnostics) can't corrupt mpb's ANSI cursor

@@ -38,6 +38,7 @@ type ProgressReporter struct {
 	numWorkers   int
 	barCounter   atomic.Int64 // incrementing priority for new file bars
 	completionSeq atomic.Int64 // incrementing sequence assigned at completion time
+	completionMu  sync.Mutex  // serializes seqNum assignment + bar completion to prevent out-of-order pops
 
 	failedBars   []*mpb.Bar  // bars for failed transfers, completed at end
 	failedStates []*barState // corresponding states
@@ -55,6 +56,8 @@ type ProgressReporter struct {
 	transferredBytes atomic.Int64 // bytes from completed transfers this session (excludes resumed)
 	streamedBytes    atomic.Int64 // bytes read through barCountingReader (real-time, includes in-flight)
 	failedFiles      atomic.Int64
+	maxPrependWidth  atomic.Int64 // high-water mark for prepend decorator width (only grows)
+	maxAppendWidth   atomic.Int64 // high-water mark for append decorator width (only grows)
 	startTime        time.Time
 	logger           *slog.Logger
 }
@@ -220,13 +223,15 @@ func (pr *ProgressReporter) StartTransfer(workerID int, job ObjectJob) {
 		mpb.BarPriority(priority),
 		mpb.PrependDecorators(
 			decor.Any(func(s decor.Statistics) string {
+				var result string
 				if bs.failed.Load() {
-					return fmt.Sprintf(" ERR  %s ", displayName)
+					result = fmt.Sprintf(" ERR  %s ", displayName)
+				} else if n := bs.seqNum.Load(); n > 0 {
+					result = fmt.Sprintf("%4d  %s ", n, displayName)
+				} else {
+					result = fmt.Sprintf("      %s ", displayName)
 				}
-				if n := bs.seqNum.Load(); n > 0 {
-					return fmt.Sprintf("%4d  %s ", n, displayName)
-				}
-				return fmt.Sprintf("      %s ", displayName)
+				return pr.padToHighWater(&pr.maxPrependWidth, result)
 			}, decor.WCSyncSpaceR),
 		),
 		mpb.AppendDecorators(
@@ -235,52 +240,51 @@ func (pr *ProgressReporter) StartTransfer(workerID int, job ObjectJob) {
 				if bs.failed.Load() {
 					return ""
 				}
+				var result string
 				frozenNs := bs.elapsedNs.Load()
 				if frozenNs > 0 {
 					// Completed: show percentage, total size, elapsed time, effective speed
-					pct := float64(0)
-					if s.Total > 0 {
-						pct = float64(s.Current) / float64(s.Total) * 100
-					}
 					elapsed := time.Duration(frozenNs)
 					size := float64(s.Total)
 					speed := float64(0)
 					if elapsed > 0 {
 						speed = size / elapsed.Seconds()
 					}
-					return fmt.Sprintf("%3.0f%%  %s  %5s  %s/s",
-						pct,
+					result = fmt.Sprintf("100%%  %s  %5s  %s/s",
 						formatSize(size),
 						formatDuration(elapsed),
 						formatSize(speed),
 					)
+				} else {
+					// In-progress: show percentage, current/total, speed, and retry info
+					pct := float64(0)
+					if s.Total > 0 {
+						pct = float64(s.Current) / float64(s.Total) * 100
+					}
+					retryInfo := ""
+					if r := bs.retryCount.Load(); r > 0 {
+						retryInfo = fmt.Sprintf("  (retry %d)", r)
+					}
+					elapsed := time.Since(bs.startTime).Seconds()
+					if elapsed >= 1 && s.Current > 0 {
+						speed := float64(s.Current) / elapsed
+						result = fmt.Sprintf("%3.0f%%  %s / %s  %s/s%s",
+							pct,
+							formatSize(float64(s.Current)),
+							formatSize(float64(s.Total)),
+							formatSize(speed),
+							retryInfo,
+						)
+					} else {
+						result = fmt.Sprintf("%3.0f%%  %s / %s%s",
+							pct,
+							formatSize(float64(s.Current)),
+							formatSize(float64(s.Total)),
+							retryInfo,
+						)
+					}
 				}
-				// In-progress: show percentage, current/total, speed, and retry info
-				pct := float64(0)
-				if s.Total > 0 {
-					pct = float64(s.Current) / float64(s.Total) * 100
-				}
-				retryInfo := ""
-				if r := bs.retryCount.Load(); r > 0 {
-					retryInfo = fmt.Sprintf("  (retry %d)", r)
-				}
-				elapsed := time.Since(bs.startTime).Seconds()
-				if elapsed >= 1 && s.Current > 0 {
-					speed := float64(s.Current) / elapsed
-					return fmt.Sprintf("%3.0f%%  %s / %s  %s/s%s",
-						pct,
-						formatSize(float64(s.Current)),
-						formatSize(float64(s.Total)),
-						formatSize(speed),
-						retryInfo,
-					)
-				}
-				return fmt.Sprintf("%3.0f%%  %s / %s%s",
-					pct,
-					formatSize(float64(s.Current)),
-					formatSize(float64(s.Total)),
-					retryInfo,
-				)
+				return pr.padToHighWater(&pr.maxAppendWidth, result)
 			}, decor.WCSyncSpace),
 		),
 	)
@@ -298,16 +302,23 @@ func (pr *ProgressReporter) CompleteTransfer(workerID int, job ObjectJob) {
 		if bar != nil {
 			bs := pr.currentState[workerID]
 			if bs != nil {
-				// Assign completion sequence number and freeze elapsed time
-				// before triggering bar completion, so the final render shows both.
-				bs.seqNum.Store(pr.completionSeq.Add(1))
 				bs.elapsedNs.CompareAndSwap(0, int64(time.Since(bs.startTime)))
 			}
-			// Ensure bar shows exactly 100%. PopCompletedMode on the
-			// container moves completed bars out of the active render area
-			// into static scrollback, so each file appears once.
+			// Serialize sequence assignment + bar completion so bars pop to
+			// scrollback in strict sequence order. The mutex ensures seq N
+			// is assigned and completed before seq N+1. Setting the bar's
+			// priority to the sequence number ensures that when multiple
+			// bars complete in the same mpb render cycle, they pop in
+			// sequence order (mpb pops in priority-ascending order).
+			pr.completionMu.Lock()
+			seq := int(pr.completionSeq.Add(1))
+			if bs != nil {
+				bs.seqNum.Store(int64(seq))
+			}
+			bar.SetPriority(seq)
 			bar.SetCurrent(job.Size)
 			bar.SetTotal(job.Size, true)
+			pr.completionMu.Unlock()
 			pr.currentBars[workerID] = nil
 			pr.currentState[workerID] = nil
 		}
@@ -470,6 +481,27 @@ func (pr *ProgressReporter) Complete() {
 // Wait blocks until all progress bars complete rendering.
 func (pr *ProgressReporter) Wait() {
 	pr.container.Wait()
+}
+
+// padToHighWater pads s to at least the high-water mark width tracked in hwm.
+// The width only grows, never shrinks, so decorator columns stay stable as
+// bars pop and new ones appear with different content lengths.
+func (pr *ProgressReporter) padToHighWater(hwm *atomic.Int64, s string) string {
+	w := int64(len(s))
+	for {
+		cur := hwm.Load()
+		if w > cur {
+			if hwm.CompareAndSwap(cur, w) {
+				break
+			}
+			continue
+		}
+		if w < cur {
+			return fmt.Sprintf("%-*s", cur, s)
+		}
+		break
+	}
+	return s
 }
 
 // formatSize returns a fixed-width (9 char) human-readable size string using

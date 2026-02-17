@@ -36,8 +36,10 @@ type Config struct {
 	MaxRetries int
 	StateDir   string
 	StateGCS   string
-	DryRun     bool
-	Speedtest  bool
+	DryRun           bool
+	Speedtest        bool
+	Compare          bool
+	CheckDestination bool
 
 	// Observability
 	Logger   *slog.Logger
@@ -91,7 +93,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.StateDir != "" {
+	if c.StateDir != "" && !c.Compare && !c.Speedtest {
 		if err := os.MkdirAll(c.StateDir, 0755); err != nil {
 			errs = append(errs, fmt.Errorf("cannot create state-dir: %w", err))
 		}

@@ -120,6 +120,23 @@ func (sm *StateManager) CompletedBytesForPrefix(prefix string) int64 {
 	return total
 }
 
+// MarkMatchingAsCompleted adds destination-verified objects to the completed set
+// without re-transferring. Returns the number of new entries added.
+func (sm *StateManager) MarkMatchingAsCompleted(destObjects map[string]ObjectInfo) int {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	added := 0
+	for key, obj := range destObjects {
+		if _, exists := sm.completed[key]; !exists {
+			sm.completed[key] = obj.Size
+			fmt.Fprintf(sm.file, "%s\t%s\t%d\t%s\n",
+				time.Now().Format(time.RFC3339), key, obj.Size, "dest-verified")
+			added++
+		}
+	}
+	return added
+}
+
 // Reset clears all completed state, truncating the log file and in-memory map.
 func (sm *StateManager) Reset() error {
 	sm.mu.Lock()
