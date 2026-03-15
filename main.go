@@ -126,6 +126,9 @@ func main() {
 		if errors.As(err, &exitErr) {
 			os.Exit(exitErr.code)
 		}
+		fmt.Fprintf(os.Stderr, "\n%s %s\n\n",
+			errorStyle.Render("Error:"),
+			valueStyle.Render(err.Error()))
 		os.Exit(1)
 	}
 }
@@ -448,10 +451,15 @@ func runMigration(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("open /dev/null: %w", err)
 	}
-	syscall.Dup2(int(devNull.Fd()), int(os.Stderr.Fd()))
+	if err := syscall.Dup2(int(devNull.Fd()), int(os.Stderr.Fd())); err != nil {
+		return fmt.Errorf("redirect stderr: %w", err)
+	}
 	devNull.Close()
 	restoreStderr := func() {
-		syscall.Dup2(termFd, int(os.Stderr.Fd()))
+		if err := syscall.Dup2(termFd, int(os.Stderr.Fd())); err != nil {
+			// Can't write to stderr here (it may still be /dev/null), write to terminal directly
+			fmt.Fprintf(terminal, "\n%s\n", errorStyle.Render("Error: failed to restore stderr: "+err.Error()))
+		}
 	}
 	defer restoreStderr()
 

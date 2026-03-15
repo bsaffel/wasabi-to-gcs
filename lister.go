@@ -98,16 +98,18 @@ func (l *Lister) ScanAndStream(ctx context.Context, jobs chan<- ObjectJob) error
 		}
 	}
 
-	// Scan complete — save manifest for future resume runs
-	manifest := &MigrationManifest{
-		TotalObjects: l.totalObjects.Load(),
-		TotalBytes:   l.totalBytes.Load(),
-		ScannedAt:    time.Now(),
-		SourceBucket: l.bucket,
-		Prefix:       l.prefix,
-	}
-	if err := l.state.SaveManifest(manifest); err != nil {
-		l.logger.Warn("failed to save manifest", slog.Any("error", err))
+	// Scan complete — save manifest for future resume runs (only if objects exist)
+	if l.totalObjects.Load() > 0 {
+		manifest := &MigrationManifest{
+			TotalObjects: l.totalObjects.Load(),
+			TotalBytes:   l.totalBytes.Load(),
+			ScannedAt:    time.Now(),
+			SourceBucket: l.bucket,
+			Prefix:       l.prefix,
+		}
+		if err := l.state.SaveManifest(manifest); err != nil {
+			l.logger.Warn("failed to save manifest", slog.Any("error", err))
+		}
 	}
 
 	l.progress.ScanComplete()

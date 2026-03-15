@@ -159,7 +159,9 @@ func (sm *StateManager) Flush() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	if sm.file != nil {
-		sm.file.Sync()
+		if err := sm.file.Sync(); err != nil {
+			sm.logger.Warn("failed to sync state file", slog.Any("error", err))
+		}
 	}
 }
 
@@ -168,7 +170,9 @@ func (sm *StateManager) Close() error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	if sm.file != nil {
-		sm.file.Sync()
+		if err := sm.file.Sync(); err != nil {
+			sm.logger.Warn("failed to sync state file on close", slog.Any("error", err))
+		}
 		return sm.file.Close()
 	}
 	return nil
@@ -187,19 +191,25 @@ func (sm *StateManager) load() error {
 	}
 	defer file.Close()
 
+	var malformed int
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.SplitN(line, "\t", 4)
 		if len(parts) < 3 {
-			continue // Skip malformed lines
+			malformed++
+			continue
 		}
 		key := parts[1]
 		size, err := strconv.ParseInt(parts[2], 10, 64)
 		if err != nil {
+			malformed++
 			continue
 		}
 		sm.completed[key] = size
+	}
+	if malformed > 0 {
+		sm.logger.Warn("skipped malformed lines in state file", slog.Int("count", malformed))
 	}
 
 	if err := scanner.Err(); err != nil {

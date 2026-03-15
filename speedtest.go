@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/charmbracelet/lipgloss"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/grpclog"
 )
 
 const (
@@ -77,6 +79,11 @@ func (z *zeroReader) Read(p []byte) (int, error) {
 }
 
 func runSpeedtest(cfg *Config) error {
+	// Suppress gRPC and stdlib logging to prevent connection setup/teardown
+	// writes from corrupting stderr output (same as runMigration does).
+	log.SetOutput(io.Discard)
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
+
 	ctx, cancel := context.WithTimeout(context.Background(), speedtestTimeout)
 	defer cancel()
 

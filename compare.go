@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/iterator"
+	"google.golang.org/grpc/grpclog"
 )
 
 // ObjectInfo describes an object in either source or destination.
@@ -44,6 +47,11 @@ type SizeMismatchEntry struct {
 
 // runCompare is the top-level entry point for --compare mode.
 func runCompare(cfg *Config) error {
+	// Suppress gRPC and stdlib logging to prevent connection setup/teardown
+	// writes from corrupting stderr output (same as runMigration does).
+	log.SetOutput(io.Discard)
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -118,6 +126,7 @@ func runCompare(cfg *Config) error {
 		statusMu.Unlock()
 		close(statusDone)
 		fmt.Fprintln(os.Stderr) // clear status line
+		fmt.Fprintf(os.Stderr, "\n%s %s\n\n", errorStyle.Render("Error:"), valueStyle.Render(err.Error()))
 		return err
 	}
 
